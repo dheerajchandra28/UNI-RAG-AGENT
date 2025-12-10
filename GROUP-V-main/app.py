@@ -1,26 +1,24 @@
-# --- Force Hugging Face Transformers to be offline ---
 import os
-os.environ['HF_HUB_OFFLINE'] = '1'
-
-# --- API & UTILITY IMPORTS ---
-import uvicorn
-import tempfile
-import hashlib
 import shutil
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+import asyncio
+import hashlib
+import tempfile
+import uvicorn
+import torch
+import glob
+import re
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional, List, Dict, Any
+
+# --- API & FASTAPI IMPORTS ---
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from typing import Optional, List
-import torch # Need torch to check for CUDA availability
 
-# --- TTS IMPORT ---
-from TTS.api import TTS
-
-# --- LANGCHAIN AND AI LIBRARIES (MODERN IMPORTS) ---
-from langchain_community.document_loaders import Docx2txtLoader
-from langchain_core.documents import Document # Needed for creating docs from OCR text
+# --- LANGCHAIN & AI IMPORTS ---
+from langchain_core.documents import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
@@ -29,332 +27,409 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_ollama import OllamaLLM
 from langchain_core.vectorstores import VectorStore
 
-# --- OCR SPECIFIC IMPORTS ---
+# --- OCR & VISION IMPORTS ---
 import pytesseract
 from pdf2image import convert_from_path
-from PIL import Image
+from PIL import Image, ImageOps
 
-# --- TESSERACT CONFIGURATION ---
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-
-
-# ===================================================================
-# GLOBAL CONFIGURATION
-# ===================================================================
-
-CHROMA_DB_PATH = "./chroma_db_folder"
-KNOWLEDGE_BASE_PATH = r"C:\Users\vijay\OneDrive\Desktop\RAG-Base" # Use your actual path
-AUDIO_DIR = "./static_audio" # Folder to serve generated audio
-
-os.makedirs(AUDIO_DIR, exist_ok=True)
-
-# ===================================================================
-# IN-MEMORY CACHE FOR TEMPORARY VECTOR STORES
-# ===================================================================
-temp_vector_stores_cache = {}
-# Optional: Limit cache size to avoid excessive memory use
-MAX_CACHE_SIZE = 10 # Store up to 10 temporary vector stores
-
-# ===================================================================
-# LOAD MODELS ON STARTUP
-# ===================================================================
-
-print("Loading TTS model... (This may take a moment)")
+# --- DOCX IMPORT ---
 try:
-    # Use recommended device placement if possible
-    tts_model = TTS("tts_models/en/ljspeech/tacotron2-DDC")
-    if torch.cuda.is_available():
-        tts_model.to("cuda")
-    print("TTS model loaded successfully.")
-except Exception as e:
-    print(f"Error loading TTS model: {e}. TTS functionality will be disabled.")
-    tts_model = None
+    from docx import Document as DocxDocument
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
+    print("WARNING: 'python-docx' not found. .docx support disabled.")
 
-print("Loading embedding model (all-MiniLM-L6-v2) to GPU...")
+# --- PPTX IMPORT ---
+try:
+    from pptx import Presentation
+    PPTX_AVAILABLE = True
+except ImportError:
+    PPTX_AVAILABLE = False
+    print("WARNING: 'python-pptx' not found. .pptx support disabled.")
+
+# --- TTS IMPORT ---
+try:
+    from TTS.api import TTS
+    TTS_AVAILABLE = True
+except ImportError:
+    print("WARNING: 'TTS' library not found. Audio generation will be disabled.")
+    TTS_AVAILABLE = False
+
+
+# ===================================================================
+# 1. CONFIGURATION & PATH MANAGEMENT
+# ===================================================================
+
+class AgentConfig:
+    # 1. Tesseract Path
+    TESSERACT_CMD = shutil.which("tesseract") or r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+    
+    # 2. Poppler Path (For PDF -> Image)
+    POPPLER_PATH = os.getenv("POPPLER_PATH", r"C:\Program Files\poppler-25.07.0\Library\bin")
+    
+    # 3. Storage Paths
+    CHROMA_DB_PATH = "./chroma_db_folder"
+    KNOWLEDGE_BASE_PATH = os.getenv("KB_PATH", r"C:\Users\vijay\OneDrive\Desktop\RAG-Base") 
+    AUDIO_DIR = "./static_audio"
+
+    # 4. Model Settings
+    LLM_MODEL = "phi3"
+    EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+    
+    # 5. Supported Extensions
+    ALLOWED_EXTENSIONS = {'.pdf', '.docx', '.pptx', '.png', '.jpg', '.jpeg'}
+
+# Apply Configuration
+os.environ['HF_HUB_OFFLINE'] = '1'
+os.makedirs(AgentConfig.AUDIO_DIR, exist_ok=True)
+pytesseract.pytesseract.tesseract_cmd = AgentConfig.TESSERACT_CMD
+
+# Verify Critical Dependencies
+if not os.path.exists(AgentConfig.TESSERACT_CMD):
+    print(f"CRITICAL WARNING: Tesseract not found at {AgentConfig.TESSERACT_CMD}. OCR will fail.")
+if not os.path.exists(AgentConfig.POPPLER_PATH):
+    print(f"CRITICAL WARNING: Poppler not found at {AgentConfig.POPPLER_PATH}. PDF processing will fail.")
+
+
+# ===================================================================
+# 2. GLOBAL RESOURCES & THREAD POOL
+# ===================================================================
+thread_pool = ThreadPoolExecutor(max_workers=4)
+temp_vector_stores_cache = {}
+MAX_CACHE_SIZE = 10 
+
+# --- LOAD MODELS ---
+print("\n--- Loading Models ---")
+
+# 1. Embeddings
+print(f"Loading Embedding Model ({AgentConfig.EMBEDDING_MODEL})...")
 try:
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
-    model_kwargs = {'device': device}
-    encode_kwargs = {'normalize_embeddings': False} # Usually recommended for Chroma
     embeddings_model = HuggingFaceEmbeddings(
-        model_name="all-MiniLM-L6-v2",
-        model_kwargs=model_kwargs,
-        encode_kwargs=encode_kwargs
+        model_name=AgentConfig.EMBEDDING_MODEL,
+        model_kwargs={'device': device},
+        encode_kwargs={'normalize_embeddings': False}
     )
-    print("Embedding model loaded successfully.")
+    print("✓ Embeddings Loaded")
 except Exception as e:
-    print(f"CRITICAL: Failed to load embedding model: {e}")
-    exit()
+    print(f"❌ Failed to load embeddings: {e}")
+    exit(1)
 
-print("Loading Ollama LLM (phi3)...")
+# 2. LLM
+print(f"Connecting to Ollama ({AgentConfig.LLM_MODEL})...")
 try:
-    llm = OllamaLLM(model="phi3")
-    llm.invoke("hello") # Test connection
-    print("Ollama LLM (phi3) connected successfully.")
+    llm = OllamaLLM(model=AgentConfig.LLM_MODEL)
+    print("✓ Ollama Connected")
 except Exception as e:
-    print(f"CRITICAL: Failed to connect to Ollama: {e}")
-    print("Please ensure the Ollama server is running and 'phi3' is installed.")
-    exit()
+    print(f"❌ Failed to connect to Ollama: {e}")
+
+# 3. TTS
+tts_model = None
+if TTS_AVAILABLE:
+    print("Loading TTS Model...")
+    try:
+        tts_model = TTS("tts_models/en/ljspeech/tacotron2-DDC")
+        if torch.cuda.is_available():
+            tts_model.to("cuda")
+        print("✓ TTS Model Loaded")
+    except Exception as e:
+        print(f"⚠️ TTS Load Error: {e}. Audio features disabled.")
+        tts_model = None
+
 
 # ===================================================================
-# REFACTORED CORE FUNCTIONS
+# 3. IMAGE PRE-PROCESSING (LEVEL 1 FIX)
 # ===================================================================
 
-def generate_audio_file_url(text: str, base_url: str) -> Optional[str]:
-    """Generates audio, saves it, returns URL."""
-    if tts_model is None:
-        print("Skipping TTS: model not loaded.")
+def improve_image_quality(image: Image.Image) -> Image.Image:
+    """
+    Pre-processes an image to make it easier for Tesseract to read.
+    1. Grayscale
+    2. Upscale (if small)
+    3. Binarize (High Contrast)
+    """
+    try:
+        # 1. Convert to Grayscale
+        image = image.convert('L')
+        
+        # 2. Upscale if image is too small (Tesseract struggles with small text)
+        width, height = image.size
+        if width < 1000:
+            scale_factor = 2
+            image = image.resize((width * scale_factor, height * scale_factor), Image.Resampling.LANCZOS)
+        
+        # 3. Increase Contrast / Binarization (Thresholding)
+        image = image.point(lambda x: 0 if x < 140 else 255, '1')
+        
+        return image
+    except Exception as e:
+        print(f"Image preprocessing warning: {e}")
+        return image  # Return original if enhancement fails
+
+def clean_ocr_text(text: str) -> str:
+    """Removes garbage characters often produced by OCR."""
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
+    text = re.sub(r'\s+([|.,;:])\s+', r'\1 ', text)
+    return text.strip()
+
+
+# ===================================================================
+# 4. CORE PROCESSING FUNCTION (Refactored for Levels 1 & 2)
+# ===================================================================
+
+def _run_processing_sync(file_path: str, file_name: str) -> List[Document]:
+    """Blocking function to process PDF, DOCX, PPTX, and Images."""
+    extracted_docs = []
+    file_lower = file_name.lower()
+    ext = os.path.splitext(file_lower)[1]
+
+    try:
+        # --- PDF PROCESSING ---
+        if ext == '.pdf':
+            images = convert_from_path(file_path, poppler_path=AgentConfig.POPPLER_PATH)
+            for i, image in enumerate(images):
+                # LEVEL 1: Improve image before reading
+                processed_img = improve_image_quality(image)
+                text = pytesseract.image_to_string(processed_img, lang='eng')
+                clean = clean_ocr_text(text)
+                
+                if clean:
+                    extracted_docs.append(Document(
+                        page_content=clean,
+                        metadata={'source': file_name, 'page': i + 1}
+                    ))
+
+        # --- DOCX PROCESSING (LEVEL 2: Tables) ---
+        elif ext == '.docx':
+            if not DOCX_AVAILABLE:
+                raise ImportError("python-docx is not installed.")
+            
+            doc = DocxDocument(file_path)
+            full_text = []
+            
+            # Extract Paragraphs
+            for para in doc.paragraphs:
+                if para.text.strip():
+                    full_text.append(para.text)
+            
+            # LEVEL 2: Extract Tables with Structure
+            for table in doc.tables:
+                table_content = []
+                for row in table.rows:
+                    row_cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                    if row_cells:
+                        table_content.append(" | ".join(row_cells))
+                
+                if table_content:
+                    full_text.append("\n[TABLE DATA]\n" + "\n".join(table_content) + "\n")
+
+            combined_text = "\n".join(full_text)
+            if combined_text.strip():
+                extracted_docs.append(Document(
+                    page_content=combined_text,
+                    metadata={'source': file_name, 'page': 1}
+                ))
+
+        # --- PPTX PROCESSING (LEVEL 2: Tables & Shapes) ---
+        elif ext == '.pptx':
+            if not PPTX_AVAILABLE:
+                raise ImportError("python-pptx is not installed.")
+            prs = Presentation(file_path)
+            
+            for i, slide in enumerate(prs.slides):
+                slide_text = []
+                
+                for shape in slide.shapes:
+                    # Case A: Standard Text Box
+                    if hasattr(shape, "text") and shape.text.strip():
+                        slide_text.append(shape.text)
+                    
+                    # Case B: Tables inside Slides (Level 2 Fix)
+                    if shape.has_table:
+                        table_rows = []
+                        for row in shape.table.rows:
+                            row_cells = [cell.text_frame.text.strip() for cell in row.cells if cell.text_frame.text.strip()]
+                            if row_cells:
+                                table_rows.append(" | ".join(row_cells))
+                        if table_rows:
+                            slide_text.append("\n[SLIDE TABLE]\n" + "\n".join(table_rows))
+
+                full_text = "\n".join(slide_text)
+                if full_text.strip():
+                    extracted_docs.append(Document(
+                        page_content=full_text,
+                        metadata={'source': file_name, 'page': i + 1}
+                    ))
+
+        # --- IMAGE PROCESSING (LEVEL 1: Enhancement) ---
+        elif ext in ['.png', '.jpg', '.jpeg']:
+            image = Image.open(file_path)
+            processed_img = improve_image_quality(image)
+            custom_config = r'--oem 3 --psm 3'
+            text = pytesseract.image_to_string(processed_img, lang='eng', config=custom_config)
+            clean = clean_ocr_text(text)
+            if clean:
+                extracted_docs.append(Document(
+                    page_content=clean,
+                    metadata={'source': file_name, 'page': 1}
+                ))
+
+    except Exception as e:
+        print(f"Error processing {file_name}: {e}")
+    
+    return extracted_docs
+
+async def extract_text_async(file_path: str, file_name: str) -> List[Document]:
+    """Async wrapper for file processing."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(thread_pool, _run_processing_sync, file_path, file_name)
+
+
+def _run_tts_sync(text: str, file_path: str):
+    if tts_model:
+        tts_model.tts_to_file(text=text, file_path=file_path)
+
+async def generate_audio_async(text: str, base_url: str) -> Optional[str]:
+    if not tts_model or not text.strip():
         return None
     try:
         text_hash = hashlib.md5(text.encode()).hexdigest()
         filename = f"{text_hash}.wav"
-        file_path = os.path.join(AUDIO_DIR, filename)
+        file_path = os.path.join(AgentConfig.AUDIO_DIR, filename)
         if not os.path.exists(file_path):
-            print(f"Generating audio: {filename}")
-            # Ensure text is not empty
-            if text and text.strip():
-                 tts_model.tts_to_file(text=text, file_path=file_path)
-            else:
-                 print("Warning: Attempted TTS on empty text.")
-                 return None # Cannot generate audio for empty text
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(thread_pool, _run_tts_sync, text, file_path)
         return f"{base_url}audio/{filename}"
-    except Exception as e:
-        print(f"Error generating audio: {e}")
+    except Exception:
         return None
 
-def extract_text_with_ocr(file_path: str, file_name: str) -> List[Document]:
-    """Extracts text using OCR for PDF, or Docx2txtLoader for DOCX."""
-    extracted_docs = []
-    file_lower = file_name.lower()
 
-    if file_lower.endswith('.pdf'):
-        print(f"Starting OCR for PDF: {file_name}")
-        try:
-            # --- Explicit Poppler Path ---
-            images = convert_from_path(
-                file_path,
-                poppler_path=r"C:\Program Files\poppler-25.07.0\Library\bin" # Use your confirmed path
-            )
-            print(f"Converted {len(images)} PDF pages to images.")
-
-            for i, image in enumerate(images):
-                page_num = i + 1
-                try:
-                    # Perform OCR
-                    # Consider adding config options like --psm if needed
-                    text = pytesseract.image_to_string(image, lang='eng')
-                    print(f"  - OCR extracted text from page {page_num} (length: {len(text)})")
-                    page_doc = Document(
-                        page_content=text if text else "", # Ensure content is string
-                        metadata={'source': file_name, 'page': page_num}
-                    )
-                    extracted_docs.append(page_doc)
-                except pytesseract.TesseractNotFoundError:
-                    print("ERROR: Tesseract executable not found or not configured.")
-                    print("Ensure Tesseract is installed and pytesseract.pytesseract.tesseract_cmd is set if needed.")
-                    raise HTTPException(status_code=500, detail="Tesseract OCR engine not found on server.")
-                except Exception as page_e:
-                    print(f"  - Error during OCR on page {page_num}: {page_e}")
-                    extracted_docs.append(Document(page_content="", metadata={'source': file_name, 'page': page_num, 'error': str(page_e)}))
-
-            if not extracted_docs:
-                 print(f"Warning: OCR yielded no documents for {file_name}")
-
-        except Exception as e:
-            # Catch errors specifically from pdf2image/poppler if possible
-            print(f"Error converting PDF to images or during OCR process: {e}")
-            # Check if it's the specific Poppler error message
-            if "Unable to get page count" in str(e):
-                 print("Poppler error detected. Ensure Poppler's bin directory is correctly specified in poppler_path.")
-                 raise HTTPException(status_code=500, detail="Error finding or using Poppler PDF tools.")
-            else:
-                 raise HTTPException(status_code=500, detail=f"Error processing PDF for OCR: {str(e)}")
-
-
-    elif file_lower.endswith('.docx'):
-        print(f"Loading DOCX: {file_name}")
-        try:
-            loader = Docx2txtLoader(file_path)
-            docs = loader.load()
-            for doc in docs:
-                doc.metadata['source'] = file_name # Ensure metadata
-            extracted_docs.extend(docs)
-        except Exception as e:
-            print(f"Error loading DOCX {file_name}: {e}")
-            raise HTTPException(status_code=500, detail=f"Error processing DOCX: {str(e)}")
-    else:
-        print(f"Unsupported file type: {file_name}")
-        raise HTTPException(status_code=400, detail=f"Unsupported file type: {file_name}. Only PDF and DOCX supported.")
-
-    print(f"Finished extraction for {file_name}. Got {len(extracted_docs)} document sections.")
-    return extracted_docs
-
-def create_single_file_vector_store(file_path: str, file_name: str) -> VectorStore:
-    """Processes file (with OCR) and creates in-memory vector store."""
-    print(f"Processing vector store for: {file_name}")
-    try:
-        docs = extract_text_with_ocr(file_path, file_name)
-        if not docs:
-             print(f"No text extracted from {file_name}, creating empty vector store.")
-             return Chroma.from_documents(documents=[], embedding=embeddings_model)
-
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        splits = text_splitter.split_documents(docs)
-        print(f"Split {file_name} into {len(splits)} chunks.")
-        if not splits:
-             print(f"Splitting resulted in zero chunks for {file_name}, creating empty vector store.")
-             return Chroma.from_documents(documents=[], embedding=embeddings_model)
-
-        print(f"Creating embeddings for {len(splits)} chunks...")
-        vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings_model)
-        print(f"Vector store created successfully for '{file_name}'.")
-        return vectorstore
-
-    except HTTPException as httpe:
-         raise httpe # Pass HTTP exceptions up
-    except Exception as e:
-        print(f"Unexpected error creating vector store for {file_name}: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error during vector store creation.")
-
-
-def load_or_create_folder_vector_store(folder_path: str) -> Chroma:
-    """Loads persistent store, indexes new files (with OCR)."""
-    print(f"Loading/Updating knowledge base: {folder_path}")
-    if not os.path.exists(folder_path):
-        os.makedirs(folder_path); print(f"Created directory: {folder_path}")
-
-    vectorstore = Chroma(
-        persist_directory=CHROMA_DB_PATH,
-        embedding_function=embeddings_model
-    )
-
-    try: # Robust check for existing files
-        existing_metadatas = vectorstore.get(include=['metadatas']).get('metadatas', [])
-        indexed_files = {meta['source'] for meta in existing_metadatas if meta and 'source' in meta}
-    except Exception as e:
-        print(f"Warning: Could not get metadata from Chroma (may be empty): {e}. Will scan all files.")
-        indexed_files = set()
-    print(f"Found {len(indexed_files)} previously indexed files in Chroma.")
-
-
-    current_files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.pdf', '.docx'))]
-    new_files = [f for f in current_files if f not in indexed_files]
-
-    if new_files:
-        print(f"New files to process: {', '.join(new_files)}")
-        all_new_splits = []
-        for filename in new_files:
-            file_path = os.path.join(folder_path, filename)
-            try:
-                docs = extract_text_with_ocr(file_path, filename)
-                if not docs:
-                    print(f"Skipping {filename}: No text extracted.")
-                    continue
-                text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-                splits = text_splitter.split_documents(docs)
-                print(f"Processed '{filename}', {len(splits)} chunks.")
-                all_new_splits.extend(splits)
-            except HTTPException as httpe:
-                print(f"HTTP Error processing {filename}: {httpe.detail}. Skipping this file.")
-            except Exception as e:
-                print(f"General Error processing {filename}: {e}. Skipping this file.")
-
-        if all_new_splits:
-            print(f"Adding {len(all_new_splits)} new chunks to vector store...")
-            vectorstore.add_documents(all_new_splits)
-            print("Knowledge base updated.")
-            # Consider persisting changes if needed: vectorstore.persist()
-    else:
-        print("Knowledge base is up-to-date.")
-    return vectorstore
+# ===================================================================
+# 5. RAG PIPELINE (FIXED: Correct Source Logic)
+# ===================================================================
 
 async def get_rag_response(query: str, vectorstore: VectorStore, base_url: str) -> dict:
-    """Performs RAG pipeline (retrieve, generate, TTS)."""
-    # (This function remains largely the same)
-    print(f"Received query: {query}")
     try:
-        retriever = vectorstore.as_retriever(search_type="mmr", search_kwargs={'k': 5, 'fetch_k': 20})
-        doc_count = 0
-        if isinstance(vectorstore, Chroma) and hasattr(vectorstore, '_collection'):
-             doc_count = vectorstore._collection.count()
-
-        if doc_count == 0:
-             print("Vector store is empty, cannot retrieve.")
-             retrieved_docs = []
-        else:
-             retrieved_docs = await retriever.ainvoke(query)
+        # 1. Retrieve Documents
+        retriever = vectorstore.as_retriever(search_type="mmr", search_kwargs={'k': 4, 'fetch_k': 20})
+        retrieved_docs = await retriever.ainvoke(query)
 
         if not retrieved_docs:
-            print("No relevant documents found.")
-            return {"response": "Could not find relevant information.", "source": None, "audio_url": None}
+            return {"response": "I couldn't find relevant information.", "source": None, "audio_url": None}
 
-        context = "\n\n---\n\n".join([doc.page_content for doc in retrieved_docs if doc.page_content])
-        top_source_filename = retrieved_docs[0].metadata.get('source', 'Unknown') if retrieved_docs else 'Unknown'
+        # 2. Extract Context and Source Deterministically
+        context_parts = []
+        for doc in retrieved_docs:
+            src = doc.metadata.get('source', 'Unknown')
+            page = doc.metadata.get('page', '?')
+            context_parts.append(f"[Source: {src}, Page: {page}]\n{doc.page_content}")
+        
+        full_context = "\n\n".join(context_parts)
+        
+        # [FIX]: Get source from the FIRST document (the most relevant one)
+        top_source = retrieved_docs[0].metadata.get('source', 'Unknown')
 
-        # Handle case where context might be empty
-        if not context.strip():
-             print("Retrieved documents contained no usable text content.")
-             return {"response": "Found relevant document sections, but they contained no text.", "source": top_source_filename, "audio_url": None}
-
-        template = "Use the following context to answer the question concisely... \n\nContext: {context}\nQuestion: {question}\nAnswer:"
+        # 3. Generate Answer
+        template = "Use the following context to answer the question... \n\nContext: {context}\nQuestion: {question}\nAnswer:"
         prompt = PromptTemplate.from_template(template)
         rag_chain = prompt | llm | StrOutputParser()
+        
+        response_text = await rag_chain.ainvoke({"context": full_context, "question": query})
+        audio_url = await generate_audio_async(response_text, base_url)
 
-        print("Generating LLM response...")
-        response_text = await rag_chain.ainvoke({"context": context, "question": query})
-
-        print("Generating audio...")
-        audio_url = generate_audio_file_url(response_text, base_url)
-
-        print("RAG response complete.")
-        return {"response": response_text, "source": top_source_filename, "audio_url": audio_url}
+        return {"response": response_text, "source": top_source, "audio_url": audio_url}
 
     except Exception as e:
-        print(f"Error in RAG pipeline: {e}")
-        raise e
+        print(f"RAG Error: {e}")
+        return {"response": f"Error: {str(e)}", "source": None}
 
 
 # ===================================================================
-# FASTAPI APP INITIALIZATION & ENDPOINTS
+# 6. FASTAPI APP & SMART KNOWLEDGE BASE
 # ===================================================================
-app = FastAPI(
-    title="Advanced RAG Agent API",
-    description="API for the Uni-RAG Agent"
-)
 
-# --- Add CORS Middleware ---
-origins = [
-    "http://localhost",
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "http://localhost:8081",
-    # Add your React app's deployed URL here later
-]
+app = FastAPI(title="Uni-RAG Agent API")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.mount("/audio", StaticFiles(directory=AgentConfig.AUDIO_DIR), name="audio")
 
-# --- Mount Static Directory ---
-app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
+folder_vector_store = None
 
-# --- Load Persistent Knowledge Base ---
-try:
-    folder_vector_store = load_or_create_folder_vector_store(KNOWLEDGE_BASE_PATH)
-    doc_count = 0
-    if folder_vector_store and hasattr(folder_vector_store, '_collection'):
-         doc_count = folder_vector_store._collection.count()
-    print(f"Persistent vector store loaded. {doc_count} documents indexed.")
-except Exception as e:
-    print(f"CRITICAL: Failed to load persistent vector store: {e}")
-    folder_vector_store = None # Handle this in the endpoint
+def init_knowledge_base():
+    """Scans RAG-Base for ALL supported files, processes them, and saves to ChromaDB."""
+    global folder_vector_store
+    
+    # 1. Initialize persistent DB
+    folder_vector_store = Chroma(
+        persist_directory=AgentConfig.CHROMA_DB_PATH,
+        embedding_function=embeddings_model
+    )
+    
+    if not os.path.exists(AgentConfig.KNOWLEDGE_BASE_PATH):
+        print(f"Warning: KB path {AgentConfig.KNOWLEDGE_BASE_PATH} does not exist.")
+        return
 
-# ===================================================================
-# API DATA MODELS (Pydantic)
-# ===================================================================
+    # 2. Get list of files already in DB
+    print("--- Scanning Knowledge Base for New Files ---")
+    existing_data = folder_vector_store.get()
+    existing_sources = set()
+    if existing_data and 'metadatas' in existing_data:
+        for meta in existing_data['metadatas']:
+            if meta and 'source' in meta:
+                existing_sources.add(meta['source'])
+    
+    print(f"Found {len(existing_sources)} existing files in DB.")
+
+    # 3. Scan directory for files
+    files_to_process = []
+    try:
+        all_files = os.listdir(AgentConfig.KNOWLEDGE_BASE_PATH)
+        for f in all_files:
+            ext = os.path.splitext(f)[1].lower()
+            if ext in AgentConfig.ALLOWED_EXTENSIONS:
+                if f not in existing_sources:
+                    files_to_process.append(f)
+    except Exception as e:
+        print(f"Error reading RAG-Base directory: {e}")
+
+    # 4. Process only NEW files
+    if not files_to_process:
+        print("✓ Knowledge Base is up to date.")
+    else:
+        print(f"Found {len(files_to_process)} new files to ingest: {files_to_process}")
+        new_docs = []
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+
+        for filename in files_to_process:
+            file_path = os.path.join(AgentConfig.KNOWLEDGE_BASE_PATH, filename)
+            print(f"Processing: {filename}...")
+            docs = _run_processing_sync(file_path, filename) 
+            
+            if docs:
+                split_docs = splitter.split_documents(docs)
+                new_docs.extend(split_docs)
+            else:
+                print(f"  Warning: No text extracted from {filename}")
+
+        if new_docs:
+            print(f"Adding {len(new_docs)} chunks to ChromaDB...")
+            folder_vector_store.add_documents(new_docs)
+            print("✓ Ingestion Complete!")
+        else:
+            print("No valid content found in new files.")
+
+
+# Trigger Smart Ingestion on Startup
+init_knowledge_base()
+
+
 class ChatRequest(BaseModel):
     query: str
 
@@ -364,142 +439,66 @@ class ChatResponse(BaseModel):
     source: Optional[str] = None
     audio_url: Optional[str] = None
 
-# ===================================================================
-# API ENDPOINTS
-# ===================================================================
-
-@app.get("/")
-def read_root():
-    return {"status": "Advanced RAG Agent API is running"}
-
-@app.post("/refresh-knowledge-base")
-def refresh_knowledge_base():
-    """Triggers a re-scan of the knowledge base folder."""
-    global folder_vector_store
-    try:
-        folder_vector_store = load_or_create_folder_vector_store(KNOWLEDGE_BASE_PATH)
-        count = 0
-        if folder_vector_store and hasattr(folder_vector_store, '_collection'):
-             count = folder_vector_store._collection.count()
-        return {"status": "Knowledge base refreshed", "documents_indexed": count}
-    except Exception as e:
-        print(f"Error refreshing knowledge base: {e}")
-        raise HTTPException(status_code=500, detail="Error refreshing knowledge base.")
 
 @app.post("/chat-folder", response_model=ChatResponse)
-async def chat_with_folder(request: ChatRequest):
-    """Chat with the persistent, pre-loaded folder of documents."""
-    if folder_vector_store is None:
-        raise HTTPException(status_code=500, detail="Store not loaded.")
-
-    base_url = "http://127.0.0.1:8000/" # Adjust if needed
-    try:
-        response_data = await get_rag_response(request.query, folder_vector_store, base_url)
-        return ChatResponse(query=request.query, **response_data)
-    except Exception as e:
-         print(f"Error in /chat-folder handling: {e}")
-         raise HTTPException(status_code=500, detail="Error processing request.")
+async def chat_with_folder(request: ChatRequest, req: Request):
+    if not folder_vector_store:
+        raise HTTPException(500, "Knowledge Base not loaded.")
+    data = await get_rag_response(request.query, folder_vector_store, str(req.base_url))
+    return ChatResponse(query=request.query, **data)
 
 
 @app.post("/chat-file", response_model=ChatResponse)
 async def chat_with_single_file(
+    request: Request,
     query: str = Form(...),
     file: UploadFile = File(...)
 ):
-    """Upload a single file for a temporary chat session. Caches the processed vector store."""
-    tmp_file_path = None
-    vectorstore = None
-    file_hash = None
-
     try:
         suffix = os.path.splitext(file.filename)[1].lower()
-        if suffix not in ['.pdf', '.docx']:
-            raise HTTPException(status_code=400, detail="Unsupported file type.")
+        if suffix not in AgentConfig.ALLOWED_EXTENSIONS:
+            raise HTTPException(400, f"Invalid file. Allowed: {AgentConfig.ALLOWED_EXTENSIONS}")
 
-        # --- Caching Step 1: Calculate File Hash ---
-        file_content = await file.read()
-        await file.seek(0) # Reset pointer
-        file_hash = hashlib.md5(file_content).hexdigest()
-        print(f"Calculated hash for {file.filename}: {file_hash}")
-
-        # --- Caching Step 2: Check Cache ---
+        content = await file.read()
+        file_hash = hashlib.md5(content).hexdigest()
+        
         if file_hash in temp_vector_stores_cache:
-            print(f"Cache hit for file hash: {file_hash}. Reusing vector store.")
             vectorstore = temp_vector_stores_cache[file_hash]
         else:
-            print(f"Cache miss for file hash: {file_hash}. Processing file...")
-            # --- Process File (Only if not in cache) ---
-            # Ensure filename is safe
-            safe_filename = "".join(c for c in file.filename if c.isalnum() or c in (' ', '.', '_')).rstrip()
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-                tmp_file.write(file_content) # Write content read earlier
-                tmp_file_path = tmp_file.name
-            print(f"Temp file saved: {tmp_file_path}")
-
-            vectorstore = create_single_file_vector_store(tmp_file_path, safe_filename)
-
-            # --- Caching Step 3: Store in Cache ---
-            if len(temp_vector_stores_cache) >= MAX_CACHE_SIZE:
-                 oldest_key = next(iter(temp_vector_stores_cache))
-                 print(f"Cache full. Evicting oldest entry: {oldest_key}")
-                 del temp_vector_stores_cache[oldest_key]
-            temp_vector_stores_cache[file_hash] = vectorstore
-            print(f"Stored vector store in cache for hash: {file_hash}")
-
-        # --- Use the vectorstore ---
-        base_url = "http://127.0.0.1:8000/" # Adjust if needed
-        response_data = await get_rag_response(query, vectorstore, base_url)
-        return ChatResponse(query=query, **response_data)
-
-    except HTTPException as httpe:
-         raise httpe # Re-raise known HTTP errors
-    except pytesseract.TesseractNotFoundError:
-         print("TesseractNotFoundError caught in endpoint.")
-         raise HTTPException(status_code=500, detail="OCR engine not found/configured.")
-    except Exception as e:
-        print(f"Unexpected error in /chat-file: {type(e).__name__}: {e}")
-        error_detail = f"Error processing file (hash: {file_hash})" if file_hash else "Error processing file."
-        raise HTTPException(status_code=500, detail=error_detail)
-    finally:
-        # Cleanup temp file ONLY if created
-        if tmp_file_path and os.path.exists(tmp_file_path):
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(content)
+                tmp_path = tmp.name
+            
             try:
-                os.remove(tmp_file_path); print(f"Cleaned up temp file: {tmp_file_path}")
-            except Exception as cleanup_e:
-                 print(f"Error cleaning up {tmp_file_path}: {cleanup_e}")
-        # Always close uploaded file object
-        if file and hasattr(file, 'file') and not file.file.closed:
-             file.file.close()
+                docs = await extract_text_async(tmp_path, file.filename)
+                
+                if not docs:
+                     raise HTTPException(400, "Could not extract text from file.")
 
+                splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+                splits = splitter.split_documents(docs)
+                
+                # [FIX]: Unique Collection Name using file_hash
+                # This ensures every uploaded file gets its own isolated bucket in Chroma
+                vectorstore = Chroma.from_documents(
+                    documents=splits, 
+                    embedding=embeddings_model,
+                    collection_name=f"temp_{file_hash}"
+                )
+                
+                if len(temp_vector_stores_cache) >= MAX_CACHE_SIZE:
+                      temp_vector_stores_cache.pop(next(iter(temp_vector_stores_cache)))
+                temp_vector_stores_cache[file_hash] = vectorstore
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
 
-# ===================================================================
-# RUN THE API
-# ===================================================================
+        data = await get_rag_response(query, vectorstore, str(request.base_url))
+        return ChatResponse(query=query, **data)
+
+    except Exception as e:
+        print(f"Endpoint Error: {e}")
+        raise HTTPException(500, f"Processing failed: {str(e)}")
 
 if __name__ == "__main__":
-    # Add explicit check for Tesseract command if needed, before starting server
-    try:
-        # This uses the command set at the top level
-        cmd = pytesseract.pytesseract.tesseract_cmd
-        if cmd and not os.path.exists(cmd):
-            print(f"WARNING: Configured Tesseract command not found at '{cmd}'")
-            print("OCR will likely fail. Ensure the path is correct.")
-        else:
-            print(f"Tesseract command set to: {cmd}")
-            # Optional: Verify Tesseract version
-            try:
-                 tesseract_version = pytesseract.get_tesseract_version()
-                 print(f"Successfully found Tesseract version: {tesseract_version}")
-            except Exception as tv_e:
-                 print(f"Could not get Tesseract version (check installation/PATH): {tv_e}")
-    except Exception as tess_check_e:
-        print(f"Could not verify Tesseract configuration: {tess_check_e}")
-        print("Ensure Tesseract is installed and PATH or tesseract_cmd is set.")
-
-    print("Starting Uvicorn server...")
-    uvicorn.run(
-        "app:app",
-        host="127.0.0.1",
-        port=8000,
-        reload=True
-    )
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
