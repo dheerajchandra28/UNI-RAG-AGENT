@@ -1,0 +1,31 @@
+# This first line is crucial for installing PyTorch with CUDA support
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# Core AI & Deep Learning Framework
+torch
+torchvision
+torchaudio
+
+# Web Application Framework
+streamlit
+
+# Local LLM and Vision Model Runner
+ollama
+
+# Offline Text-to-Speech Engine
+TTS
+
+# LangChain Core and Integrations
+langchain-core
+langchain-community
+langchain-huggingface
+langchain-chroma
+langchain-ollama
+
+# Document Loaders
+pypdf
+docx2txt
+
+# Vector Database and Embeddings
+chromadb
+sentence-transformers
